@@ -1,0 +1,8 @@
+{
+  "name": "tunnel-project",
+  "private": true,
+  "workspaces": [
+    "agent",
+    "server"
+  ]
+}
