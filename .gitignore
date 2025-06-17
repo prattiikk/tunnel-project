@@ -15,3 +15,7 @@ dist/
 # Environment files
 .env
 .env.local
+/test-server
+**/.next
+**/.npmignore
+**/.gitignore
