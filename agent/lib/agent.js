@@ -8,16 +8,18 @@ import chalk from 'chalk';
  * @param {string} tunnelServerUrl - The public tunnel server WebSocket URL
  * @param {string} agentId - Unique ID or name of the agent (e.g., "pratik050403")
  */
-export function startAgent(localPort, tunnelServerUrl, agentId) {
+export function startAgent(localPort, tunnelServerUrl, agentId, token) {
   const ws = new WebSocket(tunnelServerUrl);
 
   ws.on('open', () => {
     console.log(chalk.green(`[✓] Connected to tunnel server at ${tunnelServerUrl}`));
-    
+    const cleanToken = token.trim();
+    console.log("token is :", cleanToken);
     // 👇 Register using agentId
-    ws.send(JSON.stringify({ 
-      type: 'register', 
-      agentId 
+    ws.send(JSON.stringify({
+      type: 'register',
+      agentId,
+      token: cleanToken
     }));
 
     console.log(chalk.blue(`[~] Registered as: ${agentId}`));

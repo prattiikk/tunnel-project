@@ -6,7 +6,6 @@
 
 generator client {
   provider = "prisma-client-js"
-  output   = "../generated/prisma"
 }
 
 datasource db {
@@ -30,4 +29,71 @@ model User {
   email      String       @unique
   name       String?
   createdAt  DateTime     @default(now())
+}
+
+
+model LiveStats {
+  id                String   @id @default(cuid())
+  tunnelId          String   @unique
+  requestsLast5Min  Int      @default(0)
+  requestsLast1Hour Int      @default(0)
+  avgResponseTime   Float    @default(0)
+  errorRate         Int      @default(0)
+  lastUpdated       DateTime @default(now())
+
+  @@map("live_stats")
+}
+
+model HourlyStats {
+  id              String   @id @default(cuid())
+  tunnelId        String
+  hour            DateTime
+  totalRequests   Int
+  successRequests Int
+  errorRequests   Int
+  avgResponseTime Float
+  totalBandwidth  BigInt
+  uniqueIps       Int
+  topPaths        Json
+  topCountries    Json
+  statusCodes     Json
+  createdAt       DateTime @default(now())
+
+  @@unique([tunnelId, hour], name: "tunnelId_hour")
+  @@map("hourly_stats")
+}
+
+model DailyStats {
+  id              String   @id @default(cuid())
+  tunnelId        String
+  date            DateTime
+  totalRequests   Int
+  successRequests Int
+  errorRequests   Int
+  avgResponseTime Float
+  totalBandwidth  BigInt
+  uniqueIps       Int
+  peakHour        Int
+  createdAt       DateTime @default(now())
+
+  @@unique([tunnelId, date], name: "tunnelId_date")
+  @@map("daily_stats")
+}
+
+model RequestLog {
+  id           String   @id @default(cuid())
+  tunnelId     String
+  path         String
+  method       String
+  statusCode   Int
+  responseTime Int
+  requestSize  Int
+  responseSize Int
+  clientIp     String
+  country      String?
+  userAgent    String?
+  timestamp    DateTime @default(now())
+
+  @@index([tunnelId, timestamp])
+  @@map("request_logs")
 }

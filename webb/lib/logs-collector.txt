@@ -1,0 +1,418 @@
+import { PrismaClient } from '@prisma/client';
+import { NextRequest, NextResponse } from 'next/server';
+
+const prisma = new PrismaClient();
+
+// In-memory buffer to batch updates (reduces DB calls)
+interface RequestMetric {
+    tunnelId: string;
+    path: string;
+    country: string;
+    statusCode: number;
+    responseTime: number;
+    requestSize: number;
+    responseSize: number;
+    clientIp: string;
+    timestamp: Date;
+}
+
+// Buffer to collect metrics before batch processing
+const metricsBuffer: RequestMetric[] = [];
+const uniqueIpsBuffer = new Map<string, Set<string>>(); // tunnelId -> Set of IPs
+
+// Analytics middleware for Next.js App Router
+export function analyticsMiddleware(tunnelId: string) {
+    return async (request: NextRequest) => {
+        const startTime = Date.now();
+        
+        // Continue with the original request
+        const response = NextResponse.next();
+        
+        // Capture metrics after response (we'll do this in the background)
+        // Since we can't easily hook into the response finish event in middleware,
+        // we'll capture what we can immediately and estimate response time
+        captureMetrics(request, tunnelId, startTime, response);
+        
+        return response;
+    };
+}
+
+// Alternative approach: Create a wrapper function for API routes
+export function withAnalytics(tunnelId: string, handler: Function) {
+    return async (req: NextRequest, context?: any) => {
+        const startTime = Date.now();
+        
+        try {
+            // Execute the original handler
+            const response = await handler(req, context);
+            
+            // Capture metrics after handler execution
+            const responseTime = Date.now() - startTime;
+            await captureMetricsFromResponse(req, response, tunnelId, responseTime);
+            
+            return response;
+        } catch (error) {
+            // Capture error metrics
+            const responseTime = Date.now() - startTime;
+            await captureErrorMetrics(req, tunnelId, responseTime, error);
+            throw error;
+        }
+    };
+}
+
+// Capture metrics from the request and response
+async function captureMetrics(
+    request: NextRequest, 
+    tunnelId: string, 
+    startTime: number,
+    response: NextResponse
+) {
+    const responseTime = Date.now() - startTime;
+    const clientIp = getClientIP(request);
+    const country = await getCountryFromIP(clientIp) ?? '';
+    
+    const metric: RequestMetric = {
+        tunnelId,
+        path: new URL(request.url).pathname,
+        country,
+        statusCode: response.status || 200,
+        responseTime,
+        requestSize: parseInt(request.headers.get('content-length') || '0'),
+        responseSize: 0, // Hard to get in middleware, will be 0
+        clientIp,
+        timestamp: new Date()
+    };
+
+    // Add to buffer
+    metricsBuffer.push(metric);
+
+    // Track unique IPs per tunnel
+    if (!uniqueIpsBuffer.has(tunnelId)) {
+        uniqueIpsBuffer.set(tunnelId, new Set());
+    }
+    uniqueIpsBuffer.get(tunnelId)!.add(clientIp);
+
+    // Update live stats immediately (for real-time dashboard)
+    await updateLiveStats(tunnelId, metric);
+
+    // Process buffer if it's getting large
+    if (metricsBuffer.length >= 100) {
+        processMetricsBuffer();
+    }
+}
+
+// Capture metrics from API route response
+async function captureMetricsFromResponse(
+    request: NextRequest,
+    response: NextResponse | Response,
+    tunnelId: string,
+    responseTime: number
+) {
+    const clientIp = getClientIP(request);
+    const country = await getCountryFromIP(clientIp) ?? '';
+    
+    const metric: RequestMetric = {
+        tunnelId,
+        path: new URL(request.url).pathname,
+        country,
+        statusCode: response.status,
+        responseTime,
+        requestSize: parseInt(request.headers.get('content-length') || '0'),
+        responseSize: parseInt(response.headers.get('content-length') || '0'),
+        clientIp,
+        timestamp: new Date()
+    };
+
+    // Add to buffer
+    metricsBuffer.push(metric);
+
+    // Track unique IPs per tunnel
+    if (!uniqueIpsBuffer.has(tunnelId)) {
+        uniqueIpsBuffer.set(tunnelId, new Set());
+    }
+    uniqueIpsBuffer.get(tunnelId)!.add(clientIp);
+
+    // Update live stats immediately
+    await updateLiveStats(tunnelId, metric);
+
+    // Process buffer if needed
+    if (metricsBuffer.length >= 100) {
+        processMetricsBuffer();
+    }
+}
+
+// Capture error metrics
+async function captureErrorMetrics(
+    request: NextRequest,
+    tunnelId: string,
+    responseTime: number,
+    error: any
+) {
+    const clientIp = getClientIP(request);
+    const country = await getCountryFromIP(clientIp) ?? '';
+    
+    const metric: RequestMetric = {
+        tunnelId,
+        path: new URL(request.url).pathname,
+        country,
+        statusCode: 500, // Assume server error
+        responseTime,
+        requestSize: parseInt(request.headers.get('content-length') || '0'),
+        responseSize: 0,
+        clientIp,
+        timestamp: new Date()
+    };
+
+    metricsBuffer.push(metric);
+    await updateLiveStats(tunnelId, metric);
+}
+
+// Extract client IP from Next.js request
+function getClientIP(request: NextRequest): string {
+    // Try various headers for getting the real IP
+    const forwarded = request.headers.get('x-forwarded-for');
+    const realIp = request.headers.get('x-real-ip');
+    const cfConnectingIp = request.headers.get('cf-connecting-ip');
+    
+    if (forwarded) {
+        return forwarded.split(',')[0].trim();
+    }
+    
+    if (realIp) {
+        return realIp;
+    }
+    
+    if (cfConnectingIp) {
+        return cfConnectingIp;
+    }
+    
+    return 'unknown';
+}
+
+// Update live stats for real-time dashboard
+async function updateLiveStats(tunnelId: string, metric: RequestMetric) {
+    const now = new Date();
+    const fiveMinutesAgo = new Date(now.getTime() - 5 * 60 * 1000);
+    const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
+
+    try {
+        await prisma.liveStats.upsert({
+            where: { tunnelId },
+            create: {
+                tunnelId,
+                requestsLast5Min: 1,
+                requestsLast1Hour: 1,
+                avgResponseTime: metric.responseTime,
+                errorRate: metric.statusCode >= 400 ? 100 : 0,
+            },
+            update: {
+                requestsLast5Min: { increment: 1 },
+                requestsLast1Hour: { increment: 1 },
+                avgResponseTime: metric.responseTime, // Simplified - you might want to calculate proper average
+                errorRate: metric.statusCode >= 400 ? { increment: 1 } : undefined,
+            }
+        });
+    } catch (error) {
+        console.error('Failed to update live stats:', error);
+    }
+}
+
+// Process buffered metrics (runs every few minutes or when buffer is full)
+async function processMetricsBuffer() {
+    if (metricsBuffer.length === 0) return;
+
+    // Group metrics by tunnel and hour
+    const hourlyGroups = new Map<string, RequestMetric[]>();
+
+    for (const metric of metricsBuffer) {
+        const hourKey = `${metric.tunnelId}-${getHourKey(metric.timestamp)}`;
+        if (!hourlyGroups.has(hourKey)) {
+            hourlyGroups.set(hourKey, []);
+        }
+        hourlyGroups.get(hourKey)!.push(metric);
+    }
+
+    // Update hourly stats for each group
+    for (const [hourKey, metrics] of hourlyGroups) {
+        await updateHourlyStats(hourKey, metrics);
+    }
+
+    // Clear processed metrics
+    metricsBuffer.length = 0;
+    uniqueIpsBuffer.clear();
+}
+
+// Update hourly aggregated stats
+async function updateHourlyStats(hourKey: string, metrics: RequestMetric[]) {
+    const [tunnelId, hourString] = hourKey.split('-');
+    const hour = new Date(hourString);
+
+    // Calculate aggregated metrics
+    const totalRequests = metrics.length;
+    const successRequests = metrics.filter(m => m.statusCode < 400).length;
+    const errorRequests = totalRequests - successRequests;
+    const avgResponseTime = metrics.reduce((sum, m) => sum + m.responseTime, 0) / totalRequests;
+    const totalBandwidth = metrics.reduce((sum, m) => sum + m.requestSize + m.responseSize, 0);
+
+    // Get unique IPs for this tunnel and hour
+    const uniqueIps = new Set(metrics.map(m => m.clientIp)).size;
+
+    // Aggregate top paths
+    const pathCounts = new Map<string, number>();
+    metrics.forEach(m => {
+        pathCounts.set(m.path, (pathCounts.get(m.path) || 0) + 1);
+    });
+    const topPaths = Object.fromEntries(
+        Array.from(pathCounts.entries())
+            .sort(([, a], [, b]) => b - a)
+            .slice(0, 10)
+    );
+
+    // Aggregate top countries
+    const countryCounts = new Map<string, number>();
+    metrics.forEach(m => {
+        if (m.country) {
+            countryCounts.set(m.country, (countryCounts.get(m.country) || 0) + 1);
+        }
+    });
+    const topCountries = Object.fromEntries(
+        Array.from(countryCounts.entries())
+            .sort(([, a], [, b]) => b - a)
+            .slice(0, 10)
+    );
+
+    // Aggregate status codes
+    const statusCounts = new Map<string, number>();
+    metrics.forEach(m => {
+        const code = m.statusCode.toString();
+        statusCounts.set(code, (statusCounts.get(code) || 0) + 1);
+    });
+    const statusCodes = Object.fromEntries(statusCounts);
+
+    try {
+        await prisma.hourlyStats.upsert({
+            where: {
+                tunnelId_hour: { tunnelId, hour }
+            },
+            create: {
+                tunnelId,
+                hour,
+                totalRequests,
+                successRequests,
+                errorRequests,
+                avgResponseTime,
+                totalBandwidth,
+                uniqueIps,
+                topPaths,
+                topCountries,
+                statusCodes,
+            },
+            update: {
+                totalRequests: { increment: totalRequests },
+                successRequests: { increment: successRequests },
+                errorRequests: { increment: errorRequests },
+                avgResponseTime: (avgResponseTime), // Simplified averaging
+                totalBandwidth: { increment: totalBandwidth },
+                uniqueIps: { increment: uniqueIps },
+                // For JSON fields, you'd need more complex merging logic
+                topPaths,
+                topCountries,
+                statusCodes,
+            }
+        });
+    } catch (error) {
+        console.error('Failed to update hourly stats:', error);
+    }
+}
+
+// Helper functions
+function getHourKey(date: Date): string {
+    const hour = new Date(date);
+    hour.setMinutes(0, 0, 0);
+    return hour.toISOString();
+}
+
+async function getCountryFromIP(ip: string): Promise<string | null> {
+    try {
+        // Use a free IP geolocation service
+        const response = await fetch(`http://ip-api.com/json/${ip}?fields=countryCode`);
+        const data = await response.json();
+        return data.countryCode || null;
+    } catch {
+        return null;
+    }
+}
+
+// Run buffer processing every 2 minutes
+setInterval(processMetricsBuffer, 2 * 60 * 1000);
+
+// Daily aggregation job (run once per day)
+export async function generateDailyStats() {
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    yesterday.setHours(0, 0, 0, 0);
+
+    const today = new Date(yesterday);
+    today.setDate(today.getDate() + 1);
+
+    // Get all hourly stats for yesterday
+    const hourlyStats = await prisma.hourlyStats.findMany({
+        where: {
+            hour: {
+                gte: yesterday,
+                lt: today
+            }
+        }
+    });
+
+    // Group by tunnel
+    const tunnelGroups = new Map<string, typeof hourlyStats>();
+    hourlyStats.forEach(stat => {
+        if (!tunnelGroups.has(stat.tunnelId)) {
+            tunnelGroups.set(stat.tunnelId, []);
+        }
+        tunnelGroups.get(stat.tunnelId)!.push(stat);
+    });
+
+    // Create daily stats for each tunnel
+    for (const [tunnelId, stats] of tunnelGroups) {
+        const totalRequests = stats.reduce((sum, s) => sum + s.totalRequests, 0);
+        const successRequests = stats.reduce((sum, s) => sum + s.successRequests, 0);
+        const errorRequests = stats.reduce((sum, s) => sum + s.errorRequests, 0);
+        const avgResponseTime = stats.reduce((sum, s) => sum + s.avgResponseTime, 0) / stats.length;
+        const totalBandwidth = stats.reduce((sum, s) => sum + BigInt(s.totalBandwidth), BigInt(0));
+        const uniqueIps = stats.reduce((sum, s) => sum + s.uniqueIps, 0);
+
+        // Find peak hour
+        const peakHourStat = stats.reduce((max, current) =>
+            current.totalRequests > max.totalRequests ? current : max
+        );
+        const peakHour = peakHourStat.hour.getHours();
+
+        await prisma.dailyStats.upsert({
+            where: {
+                tunnelId_date: { tunnelId, date: yesterday }
+            },
+            create: {
+                tunnelId,
+                date: yesterday,
+                totalRequests,
+                successRequests,
+                errorRequests,
+                avgResponseTime,
+                totalBandwidth,
+                uniqueIps,
+                peakHour,
+            },
+            update: {
+                totalRequests,
+                successRequests,
+                errorRequests,
+                avgResponseTime,
+                totalBandwidth,
+                uniqueIps,
+                peakHour,
+            }
+        });
+    }
+}
