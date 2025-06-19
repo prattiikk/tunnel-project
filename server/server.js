@@ -21,8 +21,33 @@ const metricsBuffer = [];
 const uniqueIpsBuffer = new Map(); // tunnelId → Set of IPs
 const activeRequests = new Map(); // requestId → { startTime, agentId, req }
 
+// Console logging helpers
+function logWithTimestamp(level, message, data = null) {
+    const timestamp = new Date().toISOString();
+    const prefix = {
+        'INFO': '📊',
+        'SUCCESS': '✅',
+        'ERROR': '❌',
+        'WARN': '⚠️',
+        'DEBUG': '🔍'
+    }[level] || 'ℹ️';
+    
+    console.log(`${prefix} [${timestamp}] ${message}`);
+    if (data) {
+        console.log(JSON.stringify(data, null, 2));
+    }
+}
+
+function formatBytes(bytes) {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
 // Analytics middleware
-async function captureRequestMetrics(req, res, agentId) {
+async function storeReqData(req, res, agentId) {
     const startTime = Date.now();
     const requestId = uuidv4();
 
@@ -35,6 +60,16 @@ async function captureRequestMetrics(req, res, agentId) {
         method: req.method,
         clientIp: getClientIP(req),
         requestSize: parseInt(req.get('content-length') || '0')
+    });
+
+    logWithTimestamp('DEBUG', `📥 Incoming request`, {
+        requestId: requestId.substring(0, 8),
+        tunnelId: agentId,
+        method: req.method,
+        path: req.path,
+        clientIp: getClientIP(req),
+        userAgent: req.get('user-agent')?.substring(0, 50) + '...',
+        requestSize: formatBytes(parseInt(req.get('content-length') || '0'))
     });
 
     // Hook into response finish
@@ -52,8 +87,15 @@ async function captureRequestMetrics(req, res, agentId) {
         const responseTime = Date.now() - startTime;
         responseSize = Buffer.byteLength(data || '', 'utf8');
 
+        logWithTimestamp('DEBUG', `📤 Outgoing response`, {
+            requestId: requestId.substring(0, 8),
+            statusCode,
+            responseTime: `${responseTime}ms`,
+            responseSize: formatBytes(responseSize)
+        });
+
         // Capture metrics
-        captureMetrics(requestId, statusCode, responseTime, responseSize);
+        storeRespData(requestId, statusCode, responseTime, responseSize);
 
         return originalSend.call(this, data);
     };
@@ -61,7 +103,7 @@ async function captureRequestMetrics(req, res, agentId) {
     return requestId;
 }
 
-async function captureMetrics(requestId, statusCode, responseTime, responseSize) {
+async function storeRespData(requestId, statusCode, responseTime, responseSize) {
     const requestData = activeRequests.get(requestId);
     if (!requestData) return;
 
@@ -85,18 +127,35 @@ async function captureMetrics(requestId, statusCode, responseTime, responseSize)
 
     // Add to buffer
     metricsBuffer.push(metric);
+    
+    logWithTimestamp('INFO', `📊 Metric captured for tunnel ${agentId}`, {
+        path: `${req.method} ${req.path}`,
+        statusCode,
+        responseTime: `${responseTime}ms`,
+        country,
+        bufferSize: metricsBuffer.length
+    });
 
     // Track unique IPs per tunnel
     if (!uniqueIpsBuffer.has(agentId)) {
         uniqueIpsBuffer.set(agentId, new Set());
     }
+    const wasNewIp = !uniqueIpsBuffer.get(agentId).has(clientIp);
     uniqueIpsBuffer.get(agentId).add(clientIp);
+    
+    if (wasNewIp) {
+        logWithTimestamp('INFO', `🌍 New unique visitor for tunnel ${agentId}`, {
+            country,
+            totalUniqueIps: uniqueIpsBuffer.get(agentId).size
+        });
+    }
 
     // Update live stats immediately
     await updateLiveStats(agentId, metric);
 
     // Process buffer if it's getting large
     if (metricsBuffer.length >= 100) {
+        logWithTimestamp('WARN', `Buffer size reached 100, processing metrics...`);
         processMetricsBuffer();
     }
 
@@ -118,7 +177,7 @@ function getClientIP(req) {
 // Update live stats for real-time dashboard
 async function updateLiveStats(tunnelId, metric) {
     try {
-        await prisma.liveStats.upsert({
+        const liveStats = await prisma.liveStats.upsert({
             where: { tunnelId },
             create: {
                 tunnelId,
@@ -136,8 +195,21 @@ async function updateLiveStats(tunnelId, metric) {
                 lastUpdated: new Date()
             }
         });
+
+        logWithTimestamp('SUCCESS', `💾 Live stats updated for tunnel ${tunnelId}`, {
+            requests5Min: liveStats.requestsLast5Min,
+            requests1Hour: liveStats.requestsLast1Hour,
+            avgResponseTime: `${liveStats.avgResponseTime}ms`,
+            errorRate: liveStats.errorRate,
+            isError: metric.statusCode >= 400
+        });
+
     } catch (error) {
-        console.error('Failed to update live stats:', error);
+        logWithTimestamp('ERROR', `Failed to update live stats for tunnel ${tunnelId}`, {
+            error: error.message,
+            tunnelId,
+            metric
+        });
     }
 }
 
@@ -145,7 +217,10 @@ async function updateLiveStats(tunnelId, metric) {
 async function processMetricsBuffer() {
     if (metricsBuffer.length === 0) return;
 
-    console.log(`📊 Processing ${metricsBuffer.length} metrics...`);
+    logWithTimestamp('INFO', `🔄 Processing metrics buffer`, {
+        totalMetrics: metricsBuffer.length,
+        uniqueTunnels: new Set(metricsBuffer.map(m => m.tunnelId)).size
+    });
 
     // Group metrics by tunnel and hour
     const hourlyGroups = new Map();
@@ -158,10 +233,37 @@ async function processMetricsBuffer() {
         hourlyGroups.get(hourKey).push(metric);
     }
 
+    logWithTimestamp('INFO', `📊 Grouped into ${hourlyGroups.size} hourly buckets`);
+
     // Process each hourly group
     for (const [hourKey, metrics] of hourlyGroups) {
         await updateHourlyStats(hourKey, metrics);
     }
+
+    // Show summary of what was processed
+    const tunnelSummary = {};
+    metricsBuffer.forEach(metric => {
+        if (!tunnelSummary[metric.tunnelId]) {
+            tunnelSummary[metric.tunnelId] = { requests: 0, errors: 0, countries: new Set() };
+        }
+        tunnelSummary[metric.tunnelId].requests++;
+        if (metric.statusCode >= 400) tunnelSummary[metric.tunnelId].errors++;
+        tunnelSummary[metric.tunnelId].countries.add(metric.country);
+    });
+
+    logWithTimestamp('SUCCESS', `✅ Processed ${metricsBuffer.length} metrics`, {
+        tunnelSummary: Object.fromEntries(
+            Object.entries(tunnelSummary).map(([tunnelId, stats]) => [
+                tunnelId,
+                {
+                    requests: stats.requests,
+                    errors: stats.errors,
+                    errorRate: `${((stats.errors / stats.requests) * 100).toFixed(1)}%`,
+                    countries: stats.countries.size
+                }
+            ])
+        )
+    });
 
     // Clear processed metrics
     metricsBuffer.length = 0;
@@ -216,8 +318,21 @@ async function updateHourlyStats(hourKey, metrics) {
     });
     const statusCodes = Object.fromEntries(statusCounts);
 
+    logWithTimestamp('INFO', `📈 Updating hourly stats for tunnel ${tunnelId}`, {
+        hour: hour.toISOString(),
+        totalRequests,
+        successRequests,
+        errorRequests,
+        errorRate: `${((errorRequests / totalRequests) * 100).toFixed(1)}%`,
+        avgResponseTime: `${avgResponseTime.toFixed(2)}ms`,
+        totalBandwidth: formatBytes(totalBandwidth),
+        uniqueIps,
+        topPaths: Object.keys(topPaths).slice(0, 3),
+        topCountries: Object.keys(topCountries).slice(0, 3)
+    });
+
     try {
-        await prisma.hourlyStats.upsert({
+        const result = await prisma.hourlyStats.upsert({
             where: {
                 tunnelId_hour: { tunnelId, hour }
             },
@@ -246,15 +361,27 @@ async function updateHourlyStats(hourKey, metrics) {
                 statusCodes,
             }
         });
+
+        logWithTimestamp('SUCCESS', `💾 Hourly stats saved to database`, {
+            tunnelId,
+            hour: hour.toISOString(),
+            recordId: result.id || 'updated'
+        });
+
     } catch (error) {
-        console.error('Failed to update hourly stats:', error);
+        logWithTimestamp('ERROR', `Failed to update hourly stats`, {
+            tunnelId,
+            hour: hour.toISOString(),
+            error: error.message,
+            stack: error.stack
+        });
     }
 }
 
 // Helper function to create hour key
 function getHourKey(date) {
     const hour = new Date(date);
-    hour.setMinutes(0, 0, 0);
+    hour.setMinutes(0, 0, 0, 0);
     return hour.toISOString();
 }
 
@@ -267,9 +394,21 @@ async function getCountryFromIP(ip) {
     try {
         const response = await fetch(`http://ip-api.com/json/${ip}?fields=countryCode`);
         const data = await response.json();
-        return data.countryCode || 'UNKNOWN';
+        const country = data.countryCode || 'UNKNOWN';
+        
+        if (country !== 'UNKNOWN') {
+            logWithTimestamp('DEBUG', `🌍 IP geolocation resolved`, {
+                ip: ip.replace(/\d+$/, 'xxx'), // Partially mask IP for privacy
+                country
+            });
+        }
+        
+        return country;
     } catch (error) {
-        console.error('Failed to get country for IP:', ip, error);
+        logWithTimestamp('WARN', `Failed to get country for IP`, {
+            ip: ip.replace(/\d+$/, 'xxx'),
+            error: error.message
+        });
         return 'UNKNOWN';
     }
 }
@@ -302,13 +441,19 @@ wss.on('connection', (ws) => {
                 if (agents.has(wsAgentId)) {
                     const oldWs = agents.get(wsAgentId);
                     oldWs.close(4002, 'Duplicate agent ID. Disconnected.');
-                    console.log(`⚠️ Kicked old agent with ID: ${wsAgentId}`);
+                    logWithTimestamp('WARN', `Kicked old agent with duplicate ID: ${wsAgentId}`);
                 }
 
                 agents.set(wsAgentId, ws);
-                console.log(`[+] Agent registered: ${wsAgentId} (user: ${user.email || user.userId || 'unknown'})`);
+                logWithTimestamp('SUCCESS', `🔗 Agent registered`, {
+                    agentId: wsAgentId,
+                    user: user.email || user.userId || 'unknown',
+                    totalActiveAgents: agents.size
+                });
             } catch (err) {
-                console.error(`❌ Invalid token for agent "${agentId}":`, err.message);
+                logWithTimestamp('ERROR', `Authentication failed for agent "${agentId}"`, {
+                    error: err.message
+                });
                 ws.close(4001, 'Authentication failed');
             }
 
@@ -320,7 +465,7 @@ wss.on('connection', (ws) => {
             const res = pendingResponses.get(id);
 
             if (!res) {
-                console.warn(`⚠️ No pending response found for ID: ${id}`);
+                logWithTimestamp('WARN', `No pending response found for request ID: ${id}`);
                 return;
             }
 
@@ -332,13 +477,18 @@ wss.on('connection', (ws) => {
 
     ws.on('close', () => {
         if (wsAgentId) {
-            console.log(`[-] Agent disconnected: ${wsAgentId}`);
+            logWithTimestamp('INFO', `🔌 Agent disconnected`, {
+                agentId: wsAgentId,
+                remainingActiveAgents: agents.size - 1
+            });
             agents.delete(wsAgentId);
         }
     });
 
     ws.on('error', (err) => {
-        console.error(`❌ WebSocket error for agent ${wsAgentId || 'unknown'}:`, err.message);
+        logWithTimestamp('ERROR', `WebSocket error for agent ${wsAgentId || 'unknown'}`, {
+            error: err.message
+        });
     });
 });
 
@@ -355,11 +505,12 @@ app.use(async (req, res) => {
     const agent = agents.get(agentId);
 
     if (!agent) {
+        logWithTimestamp('WARN', `No tunnel found for agent ID: "${agentId}"`);
         return res.status(404).send(`No tunnel found for agent ID: "${agentId}"`);
     }
 
     // Start analytics tracking
-    const analyticsId = await captureRequestMetrics(req, res, agentId);
+    const analyticsId = await storeReqData(req, res, agentId);
     const requestId = uuidv4();
     let body = '';
 
@@ -382,11 +533,16 @@ app.use(async (req, res) => {
             const timeoutId = setTimeout(() => {
                 if (pendingResponses.has(requestId)) {
                     // Capture timeout as error
-                    captureMetrics(analyticsId, 504, Date.now() - activeRequests.get(analyticsId)?.startTime || 0, 0);
+                    storeRespData(analyticsId, 504, Date.now() - activeRequests.get(analyticsId)?.startTime || 0, 0);
+
+                    logWithTimestamp('WARN', `⏱️ Request timeout for tunnel ${agentId}`, {
+                        requestId: requestId.substring(0, 8),
+                        path: targetPath,
+                        method: req.method
+                    });
 
                     res.status(504).send('Request timed out');
                     pendingResponses.delete(requestId);
-                    console.warn(`⏱️ Timeout on request ID: ${requestId}`);
                 }
             }, 10000);
 
@@ -401,17 +557,23 @@ app.use(async (req, res) => {
             pendingResponses.delete(requestId);
 
             // Capture error metrics
-            captureMetrics(analyticsId, 500, Date.now() - activeRequests.get(analyticsId)?.startTime || 0, 0);
+            storeRespData(analyticsId, 500, Date.now() - activeRequests.get(analyticsId)?.startTime || 0, 0);
 
-            console.error(`❌ Failed to send request to agent:`, err.message);
+            logWithTimestamp('ERROR', `Failed to send request to agent ${agentId}`, {
+                error: err.message,
+                requestId: requestId.substring(0, 8)
+            });
             res.status(500).send('Internal tunnel error');
         }
     });
 
     req.on('error', (err) => {
-        console.error(`❌ Request error:`, err.message);
+        logWithTimestamp('ERROR', `Request error for tunnel ${agentId}`, {
+            error: err.message,
+            requestId: requestId.substring(0, 8)
+        });
         if (pendingResponses.has(requestId)) {
-            captureMetrics(analyticsId, 400, Date.now() - activeRequests.get(analyticsId)?.startTime || 0, 0);
+            storeRespData(analyticsId, 400, Date.now() - activeRequests.get(analyticsId)?.startTime || 0, 0);
             res.status(400).send('Bad request');
             pendingResponses.delete(requestId);
         }
@@ -419,13 +581,20 @@ app.use(async (req, res) => {
 });
 
 // Process metrics buffer every 2 minutes
-setInterval(processMetricsBuffer, 2 * 60 * 1000);
+setInterval(() => {
+    logWithTimestamp('INFO', `🔄 Scheduled metrics processing`, {
+        bufferSize: metricsBuffer.length,
+        uniqueTunnelsWithIps: uniqueIpsBuffer.size
+    });
+    processMetricsBuffer();
+}, 2 * 60 * 1000);
 
 // Clean up old live stats every 10 minutes
 setInterval(async () => {
     try {
         const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
-        await prisma.liveStats.updateMany({
+        
+        const result = await prisma.liveStats.updateMany({
             where: {
                 lastUpdated: {
                     lt: tenMinutesAgo
@@ -436,8 +605,17 @@ setInterval(async () => {
                 requestsLast1Hour: 0
             }
         });
+
+        if (result.count > 0) {
+            logWithTimestamp('INFO', `🧹 Cleaned up old live stats`, {
+                recordsUpdated: result.count,
+                cutoffTime: tenMinutesAgo.toISOString()
+            });
+        }
     } catch (error) {
-        console.error('Failed to clean up old live stats:', error);
+        logWithTimestamp('ERROR', 'Failed to clean up old live stats', {
+            error: error.message
+        });
     }
 }, 10 * 60 * 1000);
 
@@ -450,6 +628,11 @@ async function generateDailyStats() {
     const today = new Date(yesterday);
     today.setDate(today.getDate() + 1);
 
+    logWithTimestamp('INFO', `📊 Starting daily stats generation`, {
+        date: yesterday.toDateString(),
+        dateRange: `${yesterday.toISOString()} to ${today.toISOString()}`
+    });
+
     try {
         const hourlyStats = await prisma.hourlyStats.findMany({
             where: {
@@ -460,6 +643,8 @@ async function generateDailyStats() {
             }
         });
 
+        logWithTimestamp('INFO', `Found ${hourlyStats.length} hourly stats records for processing`);
+
         // Group by tunnel
         const tunnelGroups = new Map();
         hourlyStats.forEach(stat => {
@@ -468,6 +653,8 @@ async function generateDailyStats() {
             }
             tunnelGroups.get(stat.tunnelId).push(stat);
         });
+
+        logWithTimestamp('INFO', `Grouped into ${tunnelGroups.size} tunnels for daily aggregation`);
 
         // Create daily stats for each tunnel
         for (const [tunnelId, stats] of tunnelGroups) {
@@ -484,7 +671,20 @@ async function generateDailyStats() {
             );
             const peakHour = peakHourStat.hour.getHours();
 
-            await prisma.dailyStats.upsert({
+            logWithTimestamp('INFO', `📈 Creating daily stats for tunnel ${tunnelId}`, {
+                date: yesterday.toDateString(),
+                totalRequests,
+                successRequests,
+                errorRequests,
+                errorRate: `${((errorRequests / totalRequests) * 100).toFixed(1)}%`,
+                avgResponseTime: `${avgResponseTime.toFixed(2)}ms`,
+                totalBandwidth: formatBytes(Number(totalBandwidth)),
+                uniqueIps,
+                peakHour: `${peakHour}:00`,
+                hoursWithData: stats.length
+            });
+
+            const dailyStats = await prisma.dailyStats.upsert({
                 where: {
                     tunnelId_date: { tunnelId, date: yesterday }
                 },
@@ -509,11 +709,24 @@ async function generateDailyStats() {
                     peakHour,
                 }
             });
+
+            logWithTimestamp('SUCCESS', `💾 Daily stats saved for tunnel ${tunnelId}`, {
+                recordId: dailyStats.id || 'updated'
+            });
         }
 
-        console.log(`📊 Generated daily stats for ${tunnelGroups.size} tunnels`);
+        logWithTimestamp('SUCCESS', `✅ Daily stats generation completed`, {
+            date: yesterday.toDateString(),
+            tunnelsProcessed: tunnelGroups.size,
+            totalHourlyRecords: hourlyStats.length
+        });
+
     } catch (error) {
-        console.error('Failed to generate daily stats:', error);
+        logWithTimestamp('ERROR', 'Failed to generate daily stats', {
+            date: yesterday.toDateString(),
+            error: error.message,
+            stack: error.stack
+        });
     }
 }
 
@@ -523,6 +736,11 @@ const midnight = new Date(now);
 midnight.setHours(24, 0, 0, 0);
 const msUntilMidnight = midnight.getTime() - now.getTime();
 
+logWithTimestamp('INFO', `📅 Scheduling daily stats generation`, {
+    nextRun: midnight.toISOString(),
+    msUntilMidnight: `${Math.round(msUntilMidnight / 1000 / 60)} minutes`
+});
+
 setTimeout(() => {
     generateDailyStats();
     // Then run daily
@@ -531,20 +749,50 @@ setTimeout(() => {
 
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
-    console.log(`🚇 Tunnel server with analytics running at http://localhost:${PORT}`);
+    logWithTimestamp('SUCCESS', `🚇 Tunnel server with analytics running`, {
+        port: PORT,
+        url: `http://localhost:${PORT}`,
+        metricsBufferLimit: 100,
+        metricsProcessingInterval: '2 minutes',
+        liveStatsCleanup: '10 minutes',
+        dailyStatsGeneration: 'midnight'
+    });
 });
+
+// Show current status periodically
+setInterval(() => {
+    const stats = {
+        activeAgents: agents.size,
+        pendingResponses: pendingResponses.size,
+        metricsInBuffer: metricsBuffer.length,
+        activeRequests: activeRequests.size,
+        tunnelsWithUniqueIps: uniqueIpsBuffer.size,
+        memoryUsage: {
+            rss: formatBytes(process.memoryUsage().rss),
+            heapUsed: formatBytes(process.memoryUsage().heapUsed)
+        }
+    };
+
+    if (stats.activeAgents > 0 || stats.metricsInBuffer > 0) {
+        logWithTimestamp('INFO', `📊 Server status update`, stats);
+    }
+}, 5 * 60 * 1000); // Every 5 minutes
 
 // Graceful shutdown
 process.on('SIGTERM', async () => {
-    console.log('🔄 Processing remaining metrics before shutdown...');
+    logWithTimestamp('INFO', '🔄 Graceful shutdown initiated (SIGTERM)');
+    logWithTimestamp('INFO', 'Processing remaining metrics before shutdown...');
     await processMetricsBuffer();
     await prisma.$disconnect();
+    logWithTimestamp('SUCCESS', '✅ Shutdown complete');
     process.exit(0);
 });
 
 process.on('SIGINT', async () => {
-    console.log('🔄 Processing remaining metrics before shutdown...');
+    logWithTimestamp('INFO', '🔄 Graceful shutdown initiated (SIGINT)');
+    logWithTimestamp('INFO', 'Processing remaining metrics before shutdown...');
     await processMetricsBuffer();
     await prisma.$disconnect();
+    logWithTimestamp('SUCCESS', '✅ Shutdown complete');
     process.exit(0);
 });
