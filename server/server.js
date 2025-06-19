@@ -12,14 +12,14 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 const prisma = new PrismaClient();
 
-// In-memory store for active agents: agentId → WebSocket
+// In-memory store for active agents: tunnelId → WebSocket
 const agents = new Map();
 const pendingResponses = new Map(); // requestId → Express `res`
 
 // Analytics buffer and tracking
 const metricsBuffer = [];
 const uniqueIpsBuffer = new Map(); // tunnelId → Set of IPs
-const activeRequests = new Map(); // requestId → { startTime, agentId, req }
+const activeRequests = new Map(); // requestId → { startTime, tunnelId, req }
 
 // Console logging helpers
 function logWithTimestamp(level, message, data = null) {
@@ -31,7 +31,7 @@ function logWithTimestamp(level, message, data = null) {
         'WARN': '⚠️',
         'DEBUG': '🔍'
     }[level] || 'ℹ️';
-    
+
     console.log(`${prefix} [${timestamp}] ${message}`);
     if (data) {
         console.log(JSON.stringify(data, null, 2));
@@ -46,15 +46,95 @@ function formatBytes(bytes) {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
+// User management functions
+async function ensureUserExists(userData) {
+    try {
+        const { userId, email, name } = userData;
+
+        // First try to find existing user
+        let user = await prisma.user.findUnique({
+            where: { id: userId }
+        });
+
+        if (!user) {
+            // Try to find by email if provided
+            if (email) {
+                user = await prisma.user.findUnique({
+                    where: { email }
+                });
+            }
+
+            // Create new user if not found
+            if (!user) {
+                user = await prisma.user.create({
+                    data: {
+                        id: userId,
+                        email: email || `user_${userId}@unknown.com`,
+                        name: name || `User ${userId.substring(0, 8)}`
+                    }
+                });
+
+                logWithTimestamp('SUCCESS', `👤 Created new user`, {
+                    userId: user.id,
+                    email: user.email,
+                    name: user.name
+                });
+            } else if (user.id !== userId) {
+                // Update user ID if found by email but different ID
+                user = await prisma.user.update({
+                    where: { id: user.id },
+                    data: { id: userId }
+                });
+            }
+        }
+
+        return user;
+    } catch (error) {
+        logWithTimestamp('ERROR', `Failed to ensure user exists`, {
+            userData,
+            error: error.message
+        });
+        throw error;
+    }
+}
+
+// Generate unique subdomain
+async function generateUniqueSubdomain(baseName, userId) {
+    const baseSubdomain = baseName ?
+        baseName.toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 20) :
+        `tunnel-${userId.substring(0, 8)}`;
+
+    let subdomain = baseSubdomain;
+    let counter = 1;
+
+    while (true) {
+        const existing = await prisma.tunnel.findUnique({
+            where: { subdomain }
+        });
+
+        if (!existing) {
+            return subdomain;
+        }
+
+        subdomain = `${baseSubdomain}-${counter}`;
+        counter++;
+
+        // Prevent infinite loops
+        if (counter > 100) {
+            return `${baseSubdomain}-${Date.now()}`;
+        }
+    }
+}
+
 // Analytics middleware
-async function storeReqData(req, res, agentId) {
+async function storeReqData(req, res, tunnelId) {
     const startTime = Date.now();
     const requestId = uuidv4();
 
     // Store request info for later completion
     activeRequests.set(requestId, {
         startTime,
-        agentId,
+        tunnelId,
         req,
         path: req.path,
         method: req.method,
@@ -64,7 +144,7 @@ async function storeReqData(req, res, agentId) {
 
     logWithTimestamp('DEBUG', `📥 Incoming request`, {
         requestId: requestId.substring(0, 8),
-        tunnelId: agentId,
+        tunnelId: tunnelId,
         method: req.method,
         path: req.path,
         clientIp: getClientIP(req),
@@ -107,13 +187,13 @@ async function storeRespData(requestId, statusCode, responseTime, responseSize) 
     const requestData = activeRequests.get(requestId);
     if (!requestData) return;
 
-    const { agentId, req, clientIp, requestSize } = requestData;
+    const { tunnelId, req, clientIp, requestSize } = requestData;
 
     // Get country from IP
     const country = await getCountryFromIP(clientIp);
 
     const metric = {
-        tunnelId: agentId,
+        tunnelId: tunnelId,
         path: req.path,
         method: req.method,
         country,
@@ -122,13 +202,14 @@ async function storeRespData(requestId, statusCode, responseTime, responseSize) 
         requestSize,
         responseSize,
         clientIp,
+        userAgent: req.get('user-agent'),
         timestamp: new Date()
     };
 
     // Add to buffer
     metricsBuffer.push(metric);
-    
-    logWithTimestamp('INFO', `📊 Metric captured for tunnel ${agentId}`, {
+
+    logWithTimestamp('INFO', `📊 Metric captured for tunnel ${tunnelId}`, {
         path: `${req.method} ${req.path}`,
         statusCode,
         responseTime: `${responseTime}ms`,
@@ -137,21 +218,24 @@ async function storeRespData(requestId, statusCode, responseTime, responseSize) 
     });
 
     // Track unique IPs per tunnel
-    if (!uniqueIpsBuffer.has(agentId)) {
-        uniqueIpsBuffer.set(agentId, new Set());
+    if (!uniqueIpsBuffer.has(tunnelId)) {
+        uniqueIpsBuffer.set(tunnelId, new Set());
     }
-    const wasNewIp = !uniqueIpsBuffer.get(agentId).has(clientIp);
-    uniqueIpsBuffer.get(agentId).add(clientIp);
-    
+    const wasNewIp = !uniqueIpsBuffer.get(tunnelId).has(clientIp);
+    uniqueIpsBuffer.get(tunnelId).add(clientIp);
+
     if (wasNewIp) {
-        logWithTimestamp('INFO', `🌍 New unique visitor for tunnel ${agentId}`, {
+        logWithTimestamp('INFO', `🌍 New unique visitor for tunnel ${tunnelId}`, {
             country,
-            totalUniqueIps: uniqueIpsBuffer.get(agentId).size
+            totalUniqueIps: uniqueIpsBuffer.get(tunnelId).size
         });
     }
 
     // Update live stats immediately
-    await updateLiveStats(agentId, metric);
+    await updateLiveStats(tunnelId, metric);
+
+    // Store individual request log
+    await storeRequestLog(metric);
 
     // Process buffer if it's getting large
     if (metricsBuffer.length >= 100) {
@@ -161,6 +245,33 @@ async function storeRespData(requestId, statusCode, responseTime, responseSize) 
 
     // Clean up
     activeRequests.delete(requestId);
+}
+
+// Store individual request log
+async function storeRequestLog(metric) {
+    try {
+        await prisma.requestLog.create({
+            data: {
+                tunnelId: metric.tunnelId,
+                path: metric.path,
+                method: metric.method,
+                statusCode: metric.statusCode,
+                responseTime: metric.responseTime,
+                requestSize: metric.requestSize,
+                responseSize: metric.responseSize,
+                clientIp: metric.clientIp,
+                country: metric.country,
+                userAgent: metric.userAgent?.substring(0, 500), // Truncate long user agents
+                timestamp: metric.timestamp
+            }
+        });
+
+        logWithTimestamp('DEBUG', `📝 Request log stored for tunnel ${metric.tunnelId}`);
+    } catch (error) {
+        logWithTimestamp('ERROR', `Failed to store request log for tunnel ${metric.tunnelId}`, {
+            error: error.message
+        });
+    }
 }
 
 // Get client IP from various headers
@@ -343,7 +454,7 @@ async function updateHourlyStats(hourKey, metrics) {
                 successRequests,
                 errorRequests,
                 avgResponseTime,
-                totalBandwidth,
+                totalBandwidth: BigInt(totalBandwidth),
                 uniqueIps,
                 topPaths,
                 topCountries,
@@ -354,7 +465,7 @@ async function updateHourlyStats(hourKey, metrics) {
                 successRequests: { increment: successRequests },
                 errorRequests: { increment: errorRequests },
                 avgResponseTime: avgResponseTime,
-                totalBandwidth: { increment: totalBandwidth },
+                totalBandwidth: { increment: BigInt(totalBandwidth) },
                 uniqueIps: { increment: uniqueIps },
                 topPaths,
                 topCountries,
@@ -395,14 +506,14 @@ async function getCountryFromIP(ip) {
         const response = await fetch(`http://ip-api.com/json/${ip}?fields=countryCode`);
         const data = await response.json();
         const country = data.countryCode || 'UNKNOWN';
-        
+
         if (country !== 'UNKNOWN') {
             logWithTimestamp('DEBUG', `🌍 IP geolocation resolved`, {
                 ip: ip.replace(/\d+$/, 'xxx'), // Partially mask IP for privacy
                 country
             });
         }
-        
+
         return country;
     } catch (error) {
         logWithTimestamp('WARN', `Failed to get country for IP`, {
@@ -413,83 +524,335 @@ async function getCountryFromIP(ip) {
     }
 }
 
-// WebSocket connection handling (unchanged)
-wss.on('connection', (ws) => {
-    let wsAgentId = null;
+// Function to get tunnel by subdomain/agentId
+async function getTunnelByIdentifier(identifier) {
+    try {
+        // First try to find by subdomain
+        let tunnel = await prisma.tunnel.findUnique({
+            where: { subdomain: identifier },
+            include: { user: true }
+        });
 
-    ws.on('message', (data) => {
+        // If not found by subdomain, try by tunnel ID
+        if (!tunnel) {
+            tunnel = await prisma.tunnel.findUnique({
+                where: { id: identifier },
+                include: { user: true }
+            });
+        }
+
+        return tunnel;
+    } catch (error) {
+        logWithTimestamp('ERROR', `Failed to get tunnel by identifier: ${identifier}`, {
+            error: error.message
+        });
+        return null;
+    }
+}
+
+// Improved WebSocket connection handling
+wss.on('connection', (ws) => {
+    let wsTunnelId = null;
+    let tunnelRecord = null;
+
+    ws.on('message', async (data) => {
         let msg;
         try {
             msg = JSON.parse(data);
         } catch {
-            console.warn('⚠️ Invalid JSON received from WebSocket');
+            logWithTimestamp('WARN', '⚠️ Invalid JSON received from WebSocket');
+            ws.send(JSON.stringify({
+                type: 'error',
+                message: 'Invalid JSON format'
+            }));
             return;
         }
 
         if (msg.type === 'register') {
-            const { agentId, token } = msg;
+            const { agentId, token, tunnelName, subdomain, localPort, description } = msg;
 
             try {
-                console.log("token received on server:", token);
-                const JWT_SECRET = process.env.JWT_SECRET.trim();
-                console.log("jwt is:", JWT_SECRET);
-
-                const user = jwt.verify(token, JWT_SECRET);
-                ws.user = user;
-                wsAgentId = agentId;
-
-                if (agents.has(wsAgentId)) {
-                    const oldWs = agents.get(wsAgentId);
-                    oldWs.close(4002, 'Duplicate agent ID. Disconnected.');
-                    logWithTimestamp('WARN', `Kicked old agent with duplicate ID: ${wsAgentId}`);
+                const JWT_SECRET = process.env.JWT_SECRET?.trim();
+                if (!JWT_SECRET) {
+                    throw new Error('JWT_SECRET not configured');
                 }
 
-                agents.set(wsAgentId, ws);
-                logWithTimestamp('SUCCESS', `🔗 Agent registered`, {
-                    agentId: wsAgentId,
-                    user: user.email || user.userId || 'unknown',
-                    totalActiveAgents: agents.size
-                });
-            } catch (err) {
-                logWithTimestamp('ERROR', `Authentication failed for agent "${agentId}"`, {
-                    error: err.message
-                });
-                ws.close(4001, 'Authentication failed');
-            }
+                const userData = jwt.verify(token, JWT_SECRET);
+                ws.user = userData;
+                wsTunnelId = agentId;
 
-            return;
+                logWithTimestamp('INFO', `🔐 User authenticated`, {
+                    userId: userData.userId,
+                    email: userData.email,
+                    tunnelId: wsTunnelId
+                });
+
+                // Ensure user exists in database
+                await ensureUserExists(userData);
+
+                // Check for existing connection and close it
+                if (agents.has(wsTunnelId)) {
+                    const oldWs = agents.get(wsTunnelId);
+                    oldWs.close(4002, 'Duplicate tunnel ID. Disconnected.');
+                    logWithTimestamp('WARN', `Kicked old agent with duplicate tunnel ID: ${wsTunnelId}`);
+                    agents.delete(wsTunnelId);
+                }
+
+                // Handle tunnel creation/update
+                // Replace the tunnel creation/update logic around line 220-280
+
+                // Handle tunnel creation/update
+                try {
+                    // Look for existing tunnel by ID first, then by subdomain
+                    let existingTunnel = await prisma.tunnel.findUnique({
+                        where: { id: wsTunnelId }
+                    });
+
+                    // FIXED: Use agentId as subdomain if no explicit subdomain provided
+                    const desiredSubdomain = subdomain || wsTunnelId;
+
+                    // Check if the desired subdomain is already taken by another tunnel
+                    const subdomainConflict = await prisma.tunnel.findFirst({
+                        where: {
+                            subdomain: desiredSubdomain,
+                            id: { not: wsTunnelId } // Exclude current tunnel
+                        }
+                    });
+
+                    if (subdomainConflict) {
+                        // If there's a conflict and no explicit subdomain was provided, generate unique one
+                        const finalSubdomain = subdomain ?
+                            subdomain :
+                            await generateUniqueSubdomain(tunnelName || `tunnel-${wsTunnelId.substring(0, 8)}`, userData.userId);
+
+                        logWithTimestamp('WARN', `Subdomain conflict detected`, {
+                            desired: desiredSubdomain,
+                            conflictWith: subdomainConflict.id,
+                            using: finalSubdomain
+                        });
+
+                        desiredSubdomain = finalSubdomain;
+                    }
+
+                    if (existingTunnel) {
+                        // Update existing tunnel
+                        tunnelRecord = await prisma.tunnel.update({
+                            where: { id: existingTunnel.id },
+                            data: {
+                                name: tunnelName || existingTunnel.name,
+                                subdomain: desiredSubdomain,
+                                localPort: localPort || existingTunnel.localPort,
+                                description: description || existingTunnel.description,
+                                isActive: true,
+                                lastConnected: new Date(),
+                                connectedAt: new Date(),
+                            },
+                            include: { user: true }
+                        });
+
+                        logWithTimestamp('SUCCESS', `📝 Updated existing tunnel`, {
+                            tunnelId: tunnelRecord.id,
+                            name: tunnelRecord.name,
+                            subdomain: tunnelRecord.subdomain,
+                            previousSubdomain: existingTunnel.subdomain,
+                            previouslyActive: existingTunnel.isActive
+                        });
+                    } else {
+                        // Create new tunnel
+                        tunnelRecord = await prisma.tunnel.create({
+                            data: {
+                                id: wsTunnelId,
+                                userId: userData.userId,
+                                name: tunnelName || `Tunnel-${wsTunnelId.substring(0, 8)}`,
+                                subdomain: desiredSubdomain,
+                                localPort: localPort || 3000,
+                                description: description || 'Auto-created tunnel',
+                                isActive: true,
+                                lastConnected: new Date(),
+                                connectedAt: new Date(),
+                            },
+                            include: { user: true }
+                        });
+
+                        logWithTimestamp('SUCCESS', `🆕 Created new tunnel`, {
+                            tunnelId: tunnelRecord.id,
+                            name: tunnelRecord.name,
+                            subdomain: tunnelRecord.subdomain,
+                            userId: userData.userId,
+                            usingTunnelIdAsSubdomain: desiredSubdomain === wsTunnelId
+                        });
+                    }
+
+                    // Rest of the registration logic remains the same...
+                    // Store WebSocket connection
+                    agents.set(wsTunnelId, ws);
+
+                    // Send success response
+                    const publicUrl = `${process.env.BASE_URL || 'http://localhost:8080'}/${tunnelRecord.subdomain}`;
+
+                    ws.send(JSON.stringify({
+                        type: 'registered',
+                        success: true,
+                        tunnel: {
+                            id: tunnelRecord.id,
+                            name: tunnelRecord.name,
+                            subdomain: tunnelRecord.subdomain,
+                            url: publicUrl,
+                            isActive: tunnelRecord.isActive,
+                            localPort: tunnelRecord.localPort,
+                            description: tunnelRecord.description,
+                            createdAt: tunnelRecord.createdAt,
+                            connectedAt: tunnelRecord.connectedAt
+                        },
+                        message: existingTunnel ? 'Tunnel updated and connected' : 'Tunnel created successfully'
+                    }));
+
+                    logWithTimestamp('SUCCESS', `🔗 Tunnel registered successfully`, {
+                        tunnelId: wsTunnelId,
+                        subdomain: tunnelRecord.subdomain,
+                        publicUrl,
+                        user: userData.email,
+                        totalActiveAgents: agents.size,
+                        isNewTunnel: !existingTunnel
+                    });
+
+                } catch (dbError) {
+                    // Error handling remains the same...
+                    logWithTimestamp('ERROR', `Database error during tunnel registration`, {
+                        tunnelId: wsTunnelId,
+                        userId: userData.userId,
+                        error: dbError.message,
+                        code: dbError.code
+                    });
+
+                    ws.send(JSON.stringify({
+                        type: 'error',
+                        message: 'Failed to register tunnel in database',
+                        error: dbError.message
+                    }));
+
+                    ws.close(4003, 'Database registration failed');
+                    return;
+                }
+            } catch (authError) {
+                logWithTimestamp('ERROR', `Authentication failed`, {
+                    error: authError.message,
+                    tunnelId: wsTunnelId
+                });
+
+                ws.send(JSON.stringify({
+                    type: 'error',
+                    message: 'Authentication failed',
+                    error: authError.message
+                }));
+
+                ws.close(4001, 'Authentication failed');
+                return;
+            }
         }
 
-        if (msg.type === 'response') {
+        // Handle response messages
+        // In your WebSocket message handler, around line 315-325
+        // Replace this section:
+
+        else if (msg.type === 'response') {
             const { id, statusCode, headers, body } = msg;
             const res = pendingResponses.get(id);
 
-            if (!res) {
-                logWithTimestamp('WARN', `No pending response found for request ID: ${id}`);
-                return;
-            }
+            if (res) {
+                try {
+                    res.set(headers || {});
+                    // FIX: Ensure body is properly serialized
+                    let responseBody = body;
+                    if (typeof body === 'object' && body !== null) {
+                        responseBody = JSON.stringify(body);
+                        // Set content-type if not already set
+                        if (!res.get('content-type')) {
+                            res.set('content-type', 'application/json');
+                        }
+                    }
+                    res.status(statusCode || 200).send(responseBody || '');
+                    pendingResponses.delete(id);
 
-            res.set(headers);
-            res.status(statusCode).send(body);
-            pendingResponses.delete(id);
+                    logWithTimestamp('DEBUG', `📤 Response forwarded`, {
+                        requestId: id.substring(0, 8),
+                        tunnelId: wsTunnelId,
+                        statusCode: statusCode || 200,
+                        bodyType: typeof body,
+                        isArray: Array.isArray(body)
+                    });
+                } catch (error) {
+                    logWithTimestamp('ERROR', `Failed to send response`, {
+                        requestId: id.substring(0, 8),
+                        tunnelId: wsTunnelId,
+                        error: error.message,
+                        bodyType: typeof body,
+                        isArray: Array.isArray(body)
+                    });
+                }
+            } else {
+                logWithTimestamp('WARN', `No pending response found for request ID: ${id.substring(0, 8)}`);
+            }
+        }
+
+        // Handle ping messages for keepalive
+        else if (msg.type === 'ping') {
+            ws.send(JSON.stringify({
+                type: 'pong',
+                timestamp: Date.now()
+            }));
+        }
+
+        // Handle unknown message types
+        else {
+            logWithTimestamp('WARN', `Unknown message type received: ${msg.type}`, {
+                tunnelId: wsTunnelId
+            });
         }
     });
 
-    ws.on('close', () => {
-        if (wsAgentId) {
-            logWithTimestamp('INFO', `🔌 Agent disconnected`, {
-                agentId: wsAgentId,
-                remainingActiveAgents: agents.size - 1
-            });
-            agents.delete(wsAgentId);
+    ws.on('close', async (code, reason) => {
+        if (wsTunnelId && tunnelRecord) {
+            try {
+                await prisma.tunnel.update({
+                    where: { id: tunnelRecord.id },
+                    data: {
+                        isActive: false,
+                        lastDisconnected: new Date()
+                    }
+                });
+
+                logWithTimestamp('INFO', `🔌 Tunnel disconnected and marked inactive`, {
+                    tunnelId: tunnelRecord.id,
+                    subdomain: tunnelRecord.subdomain,
+                    code,
+                    reason: reason?.toString(),
+                    remainingAgents: agents.size - 1
+                });
+            } catch (error) {
+                logWithTimestamp('ERROR', `Failed to update tunnel on disconnect`, {
+                    tunnelId: tunnelRecord.id,
+                    error: error.message
+                });
+            }
+
+            agents.delete(wsTunnelId);
         }
     });
 
     ws.on('error', (err) => {
-        logWithTimestamp('ERROR', `WebSocket error for agent ${wsAgentId || 'unknown'}`, {
+        logWithTimestamp('ERROR', `WebSocket error`, {
+            tunnelId: wsTunnelId || 'unknown',
             error: err.message
         });
     });
+
+    // Send welcome message
+    ws.send(JSON.stringify({
+        type: 'welcome',
+        message: 'Connected to tunnel server',
+        timestamp: Date.now()
+    }));
 });
 
 // HTTP tunnel endpoint with analytics
@@ -497,20 +860,74 @@ app.use(async (req, res) => {
     const pathParts = req.path.split('/').filter(part => part !== '');
 
     if (pathParts.length === 0) {
-        return res.status(400).send('Invalid tunnel path');
+        return res.status(400).json({
+            error: 'Invalid tunnel path',
+            message: 'Please specify a tunnel subdomain: /{subdomain}/path'
+        });
     }
 
-    const [agentId, ...rest] = pathParts;
+    const [identifier, ...rest] = pathParts;
     const targetPath = '/' + rest.join('/');
-    const agent = agents.get(agentId);
+
+    // Get tunnel from database
+    const tunnel = await getTunnelByIdentifier(identifier);
+
+    if (!tunnel) {
+        logWithTimestamp('WARN', `No tunnel found for identifier: "${identifier}"`);
+        return res.status(404).json({
+            error: 'Tunnel not found',
+            message: `No tunnel found for identifier: "${identifier}"`,
+            identifier
+        });
+    }
+
+    if (!tunnel.isActive) {
+        logWithTimestamp('WARN', `Tunnel is inactive: "${identifier}"`);
+        return res.status(503).json({
+            error: 'Tunnel inactive',
+            message: `Tunnel "${identifier}" is not currently active`,
+            tunnel: {
+                id: tunnel.id,
+                name: tunnel.name,
+                subdomain: tunnel.subdomain,
+                lastConnected: tunnel.lastConnected,
+                lastDisconnected: tunnel.lastDisconnected
+            }
+        });
+    }
+
+    // Check if agent is connected
+    const agent = agents.get(tunnel.id);
 
     if (!agent) {
-        logWithTimestamp('WARN', `No tunnel found for agent ID: "${agentId}"`);
-        return res.status(404).send(`No tunnel found for agent ID: "${agentId}"`);
+        logWithTimestamp('WARN', `No active agent for tunnel: "${identifier}" (ID: ${tunnel.id})`);
+        return res.status(502).json({
+            error: 'Tunnel not connected',
+            message: `Tunnel "${identifier}" is not currently connected`,
+            tunnel: {
+                id: tunnel.id,
+                name: tunnel.name,
+                subdomain: tunnel.subdomain,
+                isActive: tunnel.isActive,
+                lastConnected: tunnel.lastConnected
+            }
+        });
     }
 
-    // Start analytics tracking
-    const analyticsId = await storeReqData(req, res, agentId);
+
+
+
+
+
+
+
+
+
+
+
+
+    // Start analytics tracking using tunnel.id
+    const analyticsId = await storeReqData(req, res, tunnel.id);
     const requestId = uuidv4();
     let body = '';
 
@@ -535,10 +952,11 @@ app.use(async (req, res) => {
                     // Capture timeout as error
                     storeRespData(analyticsId, 504, Date.now() - activeRequests.get(analyticsId)?.startTime || 0, 0);
 
-                    logWithTimestamp('WARN', `⏱️ Request timeout for tunnel ${agentId}`, {
+                    logWithTimestamp('WARN', `⏱️ Request timeout for tunnel ${tunnel.id}`, {
                         requestId: requestId.substring(0, 8),
                         path: targetPath,
-                        method: req.method
+                        method: req.method,
+                        tunnelName: tunnel.name
                     });
 
                     res.status(504).send('Request timed out');
@@ -559,18 +977,20 @@ app.use(async (req, res) => {
             // Capture error metrics
             storeRespData(analyticsId, 500, Date.now() - activeRequests.get(analyticsId)?.startTime || 0, 0);
 
-            logWithTimestamp('ERROR', `Failed to send request to agent ${agentId}`, {
+            logWithTimestamp('ERROR', `Failed to send request to tunnel ${tunnel.id}`, {
                 error: err.message,
-                requestId: requestId.substring(0, 8)
+                requestId: requestId.substring(0, 8),
+                tunnelName: tunnel.name
             });
             res.status(500).send('Internal tunnel error');
         }
     });
 
     req.on('error', (err) => {
-        logWithTimestamp('ERROR', `Request error for tunnel ${agentId}`, {
+        logWithTimestamp('ERROR', `Request error for tunnel ${tunnel.id}`, {
             error: err.message,
-            requestId: requestId.substring(0, 8)
+            requestId: requestId.substring(0, 8),
+            tunnelName: tunnel.name
         });
         if (pendingResponses.has(requestId)) {
             storeRespData(analyticsId, 400, Date.now() - activeRequests.get(analyticsId)?.startTime || 0, 0);
@@ -593,7 +1013,7 @@ setInterval(() => {
 setInterval(async () => {
     try {
         const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
-        
+
         const result = await prisma.liveStats.updateMany({
             where: {
                 lastUpdated: {
@@ -761,38 +1181,106 @@ server.listen(PORT, () => {
 
 // Show current status periodically
 setInterval(() => {
-    const stats = {
-        activeAgents: agents.size,
-        pendingResponses: pendingResponses.size,
-        metricsInBuffer: metricsBuffer.length,
-        activeRequests: activeRequests.size,
-        tunnelsWithUniqueIps: uniqueIpsBuffer.size,
-        memoryUsage: {
-            rss: formatBytes(process.memoryUsage().rss),
-            heapUsed: formatBytes(process.memoryUsage().heapUsed)
-        }
-    };
-
-    if (stats.activeAgents > 0 || stats.metricsInBuffer > 0) {
-        logWithTimestamp('INFO', `📊 Server status update`, stats);
+    if (agents.size > 0) {
+        logWithTimestamp('INFO', `📊 Server status update`, {
+            activeAgents: agents.size,
+            tunnelIds: Array.from(agents.keys()),
+            pendingResponses: pendingResponses.size,
+            metricsBufferSize: metricsBuffer.length,
+            uniqueIpsTracked: uniqueIpsBuffer.size,
+            activeRequests: activeRequests.size,
+            uptime: `${Math.round(process.uptime())} seconds`
+        });
     }
 }, 5 * 60 * 1000); // Every 5 minutes
 
 // Graceful shutdown
 process.on('SIGTERM', async () => {
-    logWithTimestamp('INFO', '🔄 Graceful shutdown initiated (SIGTERM)');
-    logWithTimestamp('INFO', 'Processing remaining metrics before shutdown...');
-    await processMetricsBuffer();
+    logWithTimestamp('INFO', '🛑 Received SIGTERM, gracefully shutting down...');
+
+    // Process any remaining metrics
+    if (metricsBuffer.length > 0) {
+        logWithTimestamp('INFO', `Processing ${metricsBuffer.length} remaining metrics before shutdown...`);
+        await processMetricsBuffer();
+    }
+
+    // Close all WebSocket connections
+    agents.forEach((ws, tunnelId) => {
+        logWithTimestamp('INFO', `Closing connection for tunnel: ${tunnelId}`);
+        ws.close(1000, 'Server shutting down');
+    });
+
+    // Close database connection
     await prisma.$disconnect();
-    logWithTimestamp('SUCCESS', '✅ Shutdown complete');
-    process.exit(0);
+
+    // Close HTTP server
+    server.close(() => {
+        logWithTimestamp('SUCCESS', '✅ Server shut down gracefully');
+        process.exit(0);
+    });
 });
 
 process.on('SIGINT', async () => {
-    logWithTimestamp('INFO', '🔄 Graceful shutdown initiated (SIGINT)');
-    logWithTimestamp('INFO', 'Processing remaining metrics before shutdown...');
-    await processMetricsBuffer();
+    logWithTimestamp('INFO', '🛑 Received SIGINT, gracefully shutting down...');
+
+    // Process any remaining metrics
+    if (metricsBuffer.length > 0) {
+        logWithTimestamp('INFO', `Processing ${metricsBuffer.length} remaining metrics before shutdown...`);
+        await processMetricsBuffer();
+    }
+
+    // Close all WebSocket connections
+    agents.forEach((ws, tunnelId) => {
+        logWithTimestamp('INFO', `Closing connection for tunnel: ${tunnelId}`);
+        ws.close(1000, 'Server shutting down');
+    });
+
+    // Close database connection
     await prisma.$disconnect();
-    logWithTimestamp('SUCCESS', '✅ Shutdown complete');
-    process.exit(0);
+
+    // Close HTTP server
+    server.close(() => {
+        logWithTimestamp('SUCCESS', '✅ Server shut down gracefully');
+        process.exit(0);
+    });
 });
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+    logWithTimestamp('ERROR', '💥 Uncaught Exception', {
+        error: error.message,
+        stack: error.stack
+    });
+    process.exit(1);
+});
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+    logWithTimestamp('ERROR', '💥 Unhandled Rejection', {
+        reason: reason.toString(),
+        promise: promise.toString()
+    });
+    process.exit(1);
+});
+
+// Memory usage monitoring
+setInterval(() => {
+    const memUsage = process.memoryUsage();
+    const formatMB = (bytes) => Math.round(bytes / 1024 / 1024 * 100) / 100;
+
+    // Log memory usage if it's getting high
+    if (memUsage.heapUsed > 100 * 1024 * 1024) { // > 100MB
+        logWithTimestamp('WARN', '🧠 High memory usage detected', {
+            heapUsed: `${formatMB(memUsage.heapUsed)} MB`,
+            heapTotal: `${formatMB(memUsage.heapTotal)} MB`,
+            rss: `${formatMB(memUsage.rss)} MB`,
+            external: `${formatMB(memUsage.external)} MB`,
+            metricsBufferSize: metricsBuffer.length,
+            activeRequests: activeRequests.size,
+            pendingResponses: pendingResponses.size
+        });
+    }
+}, 60 * 1000); // Every minute
+
+// Export for testing or external use
+export default server;
