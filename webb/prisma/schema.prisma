@@ -102,14 +102,28 @@ model DeviceAuthCode {
 // ============================================
 
 model Tunnel {
-  id          String   @id @default(cuid())
-  userId      String
-  name        String
-  subdomain   String   @unique
-  description String?
-  isActive    Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id               String    @id @default(cuid())
+  userId           String
+  name             String
+  subdomain        String    @unique
+  description      String?
+  localPort        Int       @default(3000)
+  isActive         Boolean   @default(false)  // Changed default to false
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  
+  // Connection tracking fields (NEW)
+  lastConnected    DateTime?
+  lastDisconnected DateTime?
+  connectedAt      DateTime? // When current session started
+  
+  // Tunnel configuration (NEW)
+  protocol         String    @default("http") // http, https
+  customDomain     String?   // For custom domain support
+  
+  // Usage tracking (NEW)
+  totalRequests    BigInt    @default(0)
+  totalBandwidth   BigInt    @default(0)
 
   // Relations
   user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -119,6 +133,9 @@ model Tunnel {
   requestLogs RequestLog[]
 
   @@index([userId])
+  @@index([isActive])
+  @@index([subdomain])
+  @@index([lastConnected])
   @@map("tunnels")
 }
 
